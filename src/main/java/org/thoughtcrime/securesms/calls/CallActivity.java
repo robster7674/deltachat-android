@@ -1091,6 +1091,25 @@ public class CallActivity extends AppCompatActivity {
   protected void onResume() {
     super.onResume();
 
+    // Cheap defensive backstop: if the coordinator believes there is no active call but we
+    // are still in a foreground call screen, force-clear any stale notification and finish
+    // the activity. This guards against future regressions where a teardown path forgets
+    // to cancel NOTIFICATION_ID_CALL or tear down the Telecom "ongoing call" registration.
+    if (viewModel != null) {
+      CallCoordinator coordinator = CallCoordinator.getInstance(getApplication());
+      if (!coordinator.hasActiveCall()) {
+        CallViewModel.CallState state = viewModel.getCallState().getValue();
+        if (state != CallViewModel.CallState.ANSWERED_ELSEWHERE
+            && state != CallViewModel.CallState.ENDED
+            && state != CallViewModel.CallState.ERROR) {
+          Log.w(TAG, "onResume: no active call in coordinator but activity is live - finishing");
+          if (!isFinishing()) {
+            finish();
+          }
+        }
+      }
+    }
+
     // Fallback for Android 16 bug: onRequestPermissionsResult not called
     if (awaitingPermissionResult && pausedWhileAwaitingPermission) {
       Log.w(TAG, "Permission result callback not received, handling in onResume");

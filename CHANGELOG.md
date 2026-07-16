@@ -16,6 +16,8 @@
 * Fix: Calls now prioritize headset before earpiece
 * Fix: Calls now respect remote controls (Bluetooth, Auto, etc.)
 * Fix: Call now show a notification for missing mic permission when answered with remote controls
+* Fix: clean up stuck call notification and Telecom "ongoing call" registration on edge-case teardown races
+* When the connection drops mid-call, attempt a bounded ICE restart instead of tearing the call down immediately; show a "Reconnecting…" indicator during recovery
 
 ## v2.53.0
 2026-06

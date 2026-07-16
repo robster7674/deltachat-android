@@ -44,6 +44,11 @@ public class CallViewModel extends AndroidViewModel {
   // Translated from coordinator's connectionState
   private final MediatorLiveData<CallState> callState;
 
+  // Latest recovery snapshot from coordinator. Read by the connection-state observer; updated
+  // by the recovery observer. Not a LiveData because it is only ever sourced from the main
+  // thread inside this ViewModel.
+  private CallCoordinator.RecoveryState recoveryStateSnapshot = CallCoordinator.RecoveryState.IDLE;
+
   // Observer References for one-time observe
   private Observer<Boolean> startOutgoingCallObserver;
 
@@ -117,15 +122,34 @@ public class CallViewModel extends AndroidViewModel {
             return;
           }
 
-          CallState newState = translateConnectionState(state);
+          CallState newState = translateConnectionState(state, recoveryStateSnapshot);
 
           if (callState.getValue() != newState) {
             callState.setValue(newState);
           }
 
-          if (state == PeerConnection.PeerConnectionState.FAILED
-              || state == PeerConnection.PeerConnectionState.CLOSED) {
+          // FAILED/CLOSED only ends the call if recovery is not active. While the
+          // coordinator is attempting an ICE restart, the connection state may momentarily
+          // report FAILED without actually terminating the call.
+          if ((state == PeerConnection.PeerConnectionState.FAILED
+                  || state == PeerConnection.PeerConnectionState.CLOSED)
+              && recoveryStateSnapshot != CallCoordinator.RecoveryState.RECONNECTING) {
             hasCallEnded.set(true);
+          }
+        });
+
+    callState.addSource(
+        callCoordinator.getRecoveryState(),
+        rState -> {
+          // Keep a local reference so the connection-state observer can consult it.
+          recoveryStateSnapshot = rState;
+          if (callState.getValue() == CallState.ANSWERED_ELSEWHERE) {
+            return;
+          }
+          CallState newState =
+              translateConnectionState(callCoordinator.getConnectionState().getValue(), rState);
+          if (callState.getValue() != newState) {
+            callState.setValue(newState);
           }
         });
 
@@ -149,7 +173,14 @@ public class CallViewModel extends AndroidViewModel {
         });
   }
 
-  private CallState translateConnectionState(PeerConnection.PeerConnectionState state) {
+  private CallState translateConnectionState(
+      PeerConnection.PeerConnectionState state, CallCoordinator.RecoveryState rState) {
+    if (rState == CallCoordinator.RecoveryState.RECONNECTING
+        || rState == CallCoordinator.RecoveryState.AWAITING_GRACE) {
+      // While recovery is in flight, freeze the UI in RECONNECTING even if the underlying
+      // peer state momentarily reports DISCONNECTED or FAILED.
+      return CallState.RECONNECTING;
+    }
     switch (state) {
       case NEW:
         if (callCoordinator.isIncomingCall()) {

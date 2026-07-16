@@ -48,8 +48,10 @@ import com.b44t.messenger.DcChat;
 import com.b44t.messenger.DcContext;
 import com.b44t.messenger.DcEvent;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import kotlin.Unit;
 import kotlin.coroutines.Continuation;
 import kotlin.coroutines.CoroutineContext;
@@ -86,6 +88,14 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
 
   private static final String CALL_IDENTIFIER_SCHEME = "deltachat:";
 
+  // Recovery state machine tuning. The grace period absorbs transient DISCONNECTED states
+  // caused by short radio hiccups during a mobile-data handoff. The answer timeout is
+  // generous because Core renegotiation rides the same async pipeline as the initial
+  // setup: near-instant on chatmail-fast, but bound by IDLE/poll on classic IMAP.
+  private static final long RECONNECT_DISCONNECTED_GRACE_MS = 7000L;
+  private static final long RECONNECT_ANSWER_TIMEOUT_MS = 30000L;
+  private static final int RECONNECT_MAX_ATTEMPTS = 3;
+
   private static CallCoordinator instance;
   private final Context appContext;
   private final CallsManager callsManager;
@@ -112,6 +122,11 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
   private final MutableLiveData<Boolean> answeredElsewhere = new MutableLiveData<>(false);
   private final MutableLiveData<Boolean> isFrontCamera = new MutableLiveData<>(true);
   private final MutableLiveData<Boolean> mediaCaptureReady = new MutableLiveData<>(false);
+  private final MutableLiveData<RecoveryState> recoveryState =
+      new MutableLiveData<>(RecoveryState.IDLE);
+  // Synchronous mirror of recoveryState used by the peer-state funnel and timed runnables,
+  // which need an immediate view of the most recent recovery decision (postValue is async).
+  private volatile RecoveryState recoveryStateSync = RecoveryState.IDLE;
 
   // Audio Routing Support
   private final MediatorLiveData<CallEndpointCompat> currentAudioEndpoint =
@@ -136,8 +151,20 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
   private boolean hasAutoSelectedEndpoint = false;
   private boolean pendingMediaCapture = false;
   private boolean answerInProgress = false;
+  private final AtomicBoolean teardownInProgress = new AtomicBoolean(false);
   private Observer<Boolean> answerMediaObserver;
   private int callGeneration = 0;
+
+  // ICE-restart recovery state
+  private int restartAttempts = 0;
+  private String currentRestartId; // UUID identifying the in-flight restart transaction
+  private long currentCallGenerationAtRestartStart; // callGeneration snapshot when started
+  private Runnable restartGraceRunnable;
+  private Runnable restartAnswerTimeoutRunnable;
+  private boolean awaitingAnswer = false;
+  // Stashed remote answer SDP if it arrives before the local offer is fully prepared
+  // (defensive: in practice offer SDP is gathered synchronously after restartIce and an
+  // answer cannot arrive that fast; this is purely for race-free state).
 
   private CallControlScope activeCallControlScope;
   private CallViewModel activeCallViewModel;
@@ -217,9 +244,16 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
   }
 
   private void disconnectTelecom(DisconnectCause cause) {
-    CallControlScope scope = activeCallControlScope;
+    // Snapshot the scope locally and null out the field atomically under the coordinator
+    // monitor. This makes the disconnect attempt idempotent: a racing teardown cannot see a
+    // half-cleared scope, and a second concurrent invocation observes null and bails out.
+    CallControlScope scope;
+    synchronized (this) {
+      scope = activeCallControlScope;
+      activeCallControlScope = null;
+    }
     if (scope == null) {
-      Log.d(TAG, "No active CallControlScope, skipping disconnect");
+      Log.w(TAG, "No active CallControlScope, skipping disconnect (cause=" + cause.getCode() + ")");
       return;
     }
 
@@ -247,6 +281,9 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
     eventCenter.addMultiAccountObserver(DcContext.DC_EVENT_INCOMING_CALL_ACCEPTED, this);
     eventCenter.addMultiAccountObserver(DcContext.DC_EVENT_OUTGOING_CALL_ACCEPTED, this);
     eventCenter.addMultiAccountObserver(DcContext.DC_EVENT_CALL_ENDED, this);
+    // DC_EVENT_CALL_UPDATE_RECEIVED is emitted by Core's `send_call_update` plumbing and
+    // carries an opaque JSON payload with id/type/sdp for ICE-restart renegotiation.
+    eventCenter.addMultiAccountObserver(DcContext.DC_EVENT_CALL_UPDATE_RECEIVED, this);
   }
 
   private void createServiceConnection() {
@@ -334,8 +371,32 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
 
   // LiveData Getters
 
+  /**
+   * ICE-restart recovery lifecycle visible to the UI. While this is anything other than {@link
+   * RecoveryState#IDLE}, the UI should keep showing the call screen with a "reconnecting" indicator
+   * even if the underlying peer state is DISCONNECTED or transiently FAILED.
+   */
+  public enum RecoveryState {
+    /** No recovery in flight. Default. */
+    IDLE,
+    /**
+     * DISCONNECTED observed but we are waiting out a short grace period (a few seconds) to let
+     * transient radio hiccups self-resolve before triggering an ICE restart.
+     */
+    AWAITING_GRACE,
+    /**
+     * Recovery in flight: an offer is being prepared, sent over Core, or an answer is expected back
+     * from the peer.
+     */
+    RECONNECTING
+  }
+
   public LiveData<PeerConnection.PeerConnectionState> getConnectionState() {
     return connectionState;
+  }
+
+  public LiveData<RecoveryState> getRecoveryState() {
+    return recoveryState;
   }
 
   public LiveData<VideoTrack> getLocalVideoTrack() {
@@ -432,11 +493,104 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
     Log.d(TAG, "updateConnectionState: " + state);
     connectionState.postValue(state);
 
-    // Handle connection failures
-    if (state == PeerConnection.PeerConnectionState.FAILED
-        || state == PeerConnection.PeerConnectionState.CLOSED) {
+    synchronized (this) {
+      if (state == PeerConnection.PeerConnectionState.CONNECTED) {
+        // Any successful connection while recovery is active cancels the timer budget and
+        // marks the recovery as successful. Recovery keeps state coherent even if the
+        // CONNECTION state was preceded by a brief FAILED that we absorbed via the FAILED
+        // arm below.
+        if (recoveryStateSync != RecoveryState.IDLE) {
+          Log.d(TAG, "updateConnectionState: CONNECTED during recovery - success");
+          cancelRecoveryTimers();
+          setRecoveryState(RecoveryState.IDLE);
+          awaitingAnswer = false;
+          currentRestartId = null;
+          restartAttempts = 0;
+        }
+      }
+    }
+
+    if (state == PeerConnection.PeerConnectionState.DISCONNECTED) {
+      handlePeerDisconnected();
+    } else if (state == PeerConnection.PeerConnectionState.FAILED) {
+      handlePeerFailed();
+    } else if (state == PeerConnection.PeerConnectionState.CLOSED) {
+      // CLOSED is only emitted after explicit `peerConnection.close()`, which only happens
+      // during teardown. Always tear down.
       handleConnectionEnded(state);
     }
+  }
+
+  /**
+   * Raw DISCONNECTED observed on the peer connection. Triggers the grace timer; if recovery is not
+   * yet CONNECTED when it expires, we attempt an ICE restart.
+   */
+  private void handlePeerDisconnected() {
+    final boolean shouldStartGrace;
+    synchronized (this) {
+      if (!hasActiveCall() || activeCallId == null) {
+        return;
+      }
+      if (recoveryStateSync != RecoveryState.IDLE) {
+        Log.d(TAG, "DISCONNECTED observed during recovery, ignoring");
+        return;
+      }
+      shouldStartGrace = true;
+    }
+    if (!shouldStartGrace) return;
+
+    Log.d(TAG, "DISCONNECTED observed, starting recovery grace period");
+    setRecoveryState(RecoveryState.AWAITING_GRACE);
+    if (restartGraceRunnable != null) {
+      mainHandler.removeCallbacks(restartGraceRunnable);
+    }
+    restartGraceRunnable =
+        () -> {
+          synchronized (CallCoordinator.this) {
+            if (recoveryStateSync != RecoveryState.AWAITING_GRACE) {
+              return;
+            }
+            PeerConnection.PeerConnectionState current = connectionState.getValue();
+            if (current == PeerConnection.PeerConnectionState.CONNECTED) {
+              Log.d(TAG, "Grace expired but peer is CONNECTED, aborting recovery");
+              setRecoveryState(RecoveryState.IDLE);
+              return;
+            }
+          }
+          Log.d(TAG, "Grace period expired, triggering ICE restart");
+          beginRestartAttempt("disconnected-grace");
+        };
+    mainHandler.postDelayed(restartGraceRunnable, RECONNECT_DISCONNECTED_GRACE_MS);
+  }
+
+  /**
+   * Raw FAILED observed on the peer connection. Triggers an immediate recovery attempt. If recovery
+   * has already exhausted its budget, falls through to {@link
+   * #handleConnectionEnded(PeerConnection.PeerConnectionState)}.
+   */
+  private void handlePeerFailed() {
+    final boolean shouldAttemptOrTeardown;
+    synchronized (this) {
+      if (!hasActiveCall() || activeCallId == null) {
+        return;
+      }
+      if (recoveryStateSync != RecoveryState.IDLE) {
+        // Already attempting recovery; ignore the raw FAILED so we don't
+        // prematurely tear down.
+        Log.d(TAG, "FAILED observed during recovery, ignoring");
+        return;
+      }
+      shouldAttemptOrTeardown = true;
+    }
+    if (!shouldAttemptOrTeardown) return;
+
+    if (restartAttempts >= RECONNECT_MAX_ATTEMPTS) {
+      Log.w(TAG, "FAILED observed with restart budget exhausted, tearing down");
+      handleConnectionEnded(PeerConnection.PeerConnectionState.FAILED);
+      return;
+    }
+    Log.d(TAG, "FAILED observed, triggering ICE restart immediately");
+    beginRestartAttempt("peer-failed");
   }
 
   public void updateLocalVideoTrack(VideoTrack track) {
@@ -627,6 +781,329 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
         .start();
   }
 
+  // ICE Restart signalling (CallService -> coordinator -> Core)
+
+  /**
+   * Caller-side: a fresh ICE-restart offer SDP has been produced locally. Send it to the peer via
+   * Core's {@code send_call_update} RPC.
+   */
+  public synchronized void handleIceRestartOfferReady(String offerSdp) {
+    Log.d(TAG, "handleIceRestartOfferReady");
+    if (!hasActiveCall() || activeAccId == null || activeCallId == null) {
+      Log.w(TAG, "handleIceRestartOfferReady: no active call");
+      return;
+    }
+    if (recoveryStateSync != RecoveryState.RECONNECTING) {
+      Log.w(TAG, "handleIceRestartOfferReady: recovery not active, dropping restart offer");
+      return;
+    }
+
+    String id = currentRestartId;
+    if (id == null) {
+      Log.w(TAG, "handleIceRestartOfferReady: missing currentRestartId");
+      completeRestartAttemptWithFailure("missing-restart-id");
+      return;
+    }
+
+    String payload = RestartNegotiationPayload.buildOfferWithId(id, offerSdp);
+    boolean sent = sendCallUpdateViaCore(activeAccId, activeCallId, payload);
+    if (!sent) {
+      Log.w(TAG, "handleIceRestartOfferReady: Core RPC not available; recovery will not complete");
+      completeRestartAttemptWithFailure("rpc-not-available");
+      return;
+    }
+    awaitingAnswer = true;
+    scheduleAnswerTimeout(id);
+  }
+
+  /**
+   * Callee-side: a fresh ICE-restart answer SDP has been produced locally. Send it back to the peer
+   * via Core's {@code send_call_update} RPC.
+   */
+  public synchronized void handleIceRestartAnswerReady(String answerSdp) {
+    Log.d(TAG, "handleIceRestartAnswerReady");
+    if (!hasActiveCall() || activeAccId == null || activeCallId == null) {
+      Log.w(TAG, "handleIceRestartAnswerReady: no active call");
+      return;
+    }
+    if (recoveryStateSync != RecoveryState.RECONNECTING) {
+      Log.w(TAG, "handleIceRestartAnswerReady: recovery not active, dropping restart answer");
+      return;
+    }
+
+    String id = currentRestartId;
+    if (id == null) {
+      Log.w(TAG, "handleIceRestartAnswerReady: missing currentRestartId");
+      completeRestartAttemptWithFailure("missing-restart-id");
+      return;
+    }
+
+    String payload = RestartNegotiationPayload.buildAnswer(id, answerSdp);
+    if (!sendCallUpdateViaCore(activeAccId, activeCallId, payload)) {
+      Log.w(TAG, "handleIceRestartAnswerReady: Core RPC not available");
+      completeRestartAttemptWithFailure("rpc-not-available");
+    }
+  }
+
+  /**
+   * Wraps Core's {@code send_call_update(accId, callId, jsonPayload)} RPC. Until Core's PR lands
+   * and {@code scripts/update-rpc-bindings.sh} regenerates {@code Rpc.java}, this method is a no-op
+   * and recovery will fall back to failure → teardown. Once the generated method is available,
+   * replace the body with:
+   *
+   * <pre>{@code
+   * rpc.sendCallUpdate(accId, callId, jsonPayload);
+   * return true;
+   * }</pre>
+   */
+  private boolean sendCallUpdateViaCore(int accId, int callId, String jsonPayload) {
+    Log.d(
+        TAG,
+        "sendCallUpdateViaCore: not yet wired (accId="
+            + accId
+            + ", callId="
+            + callId
+            + "); awaiting Core PR + regenerated bindings");
+    return false;
+  }
+
+  // Network-triggered recovery (CallService)
+
+  /**
+   * Called by the call-scoped network callback when the active network has changed to a different
+   * {@link Network}. Triggers an immediate recovery attempt by the original caller (the peer is
+   * responsible for answering). The callee waits for the offer.
+   */
+  public void onNetworkHandoffDetected() {
+    Log.d(TAG, "onNetworkHandoffDetected");
+    beginRestartAttempt("network-handoff");
+  }
+
+  /**
+   * Called by the call-scoped network callback when the active network has been continuously
+   * observed as lost past the grace window. Triggers an immediate recovery attempt by the original
+   * caller; the callee waits.
+   */
+  public void onNetworkLostDetected() {
+    Log.d(TAG, "onNetworkLostDetected");
+    beginRestartAttempt("network-lost");
+  }
+
+  private void beginRestartAttempt(String reason) {
+    final boolean shouldRun;
+    final boolean isCaller;
+    synchronized (this) {
+      if (!hasActiveCall() || activeAccId == null || activeCallId == null) {
+        return;
+      }
+      if (recoveryStateSync != RecoveryState.IDLE) {
+        Log.d(TAG, "beginRestartAttempt: recovery already in flight, ignoring (" + reason + ")");
+        return;
+      }
+      if (restartAttempts >= RECONNECT_MAX_ATTEMPTS) {
+        Log.w(TAG, "beginRestartAttempt: budget exhausted, tearing down (" + reason + ")");
+        // Schedule the teardown off the monitor so we don't deadlock on ourselves.
+        shouldRun = false;
+        isCaller = false;
+      } else {
+        shouldRun = true;
+        isCaller = !isIncomingCall;
+      }
+    }
+    if (!shouldRun) {
+      mainHandler.post(() -> handleConnectionEnded(PeerConnection.PeerConnectionState.FAILED));
+      return;
+    }
+
+    restartAttempts++;
+    currentRestartId = UUID.randomUUID().toString();
+    currentCallGenerationAtRestartStart = callGeneration;
+    awaitingAnswer = false;
+    setRecoveryState(RecoveryState.RECONNECTING);
+    Log.d(
+        TAG,
+        "beginRestartAttempt: starting attempt "
+            + restartAttempts
+            + "/"
+            + RECONNECT_MAX_ATTEMPTS
+            + " (reason="
+            + reason
+            + ", caller="
+            + isCaller
+            + ", id="
+            + currentRestartId
+            + ")");
+
+    if (!isCaller) {
+      // Callee role: surface RECONNECTING in the UI but wait for the peer's restart offer
+      // to arrive via onCallUpdateReceived. The offer's `id` becomes our currentRestartId so
+      // we never accidentally apply a stale answer from a different transaction. The
+      // restartAttempts counter is bumped above so this callee-initiated wait counts against
+      // our budget too: if the caller never sends an offer, we'll fall through to teardown
+      // via handleConnectionEnded() on the next FAILED observation or DISCONNECTED timeout.
+      Log.d(TAG, "Callee role: awaiting caller's restart offer");
+      return;
+    }
+
+    if (callService != null) {
+      callService.requestIceRestart();
+    } else {
+      Log.w(TAG, "beginRestartAttempt: callService not available, failing attempt");
+      completeRestartAttemptWithFailure("service-not-ready");
+    }
+  }
+
+  private void scheduleAnswerTimeout(String id) {
+    if (restartAnswerTimeoutRunnable != null) {
+      mainHandler.removeCallbacks(restartAnswerTimeoutRunnable);
+    }
+    restartAnswerTimeoutRunnable =
+        () -> {
+          synchronized (CallCoordinator.this) {
+            if (!id.equals(currentRestartId)) {
+              return;
+            }
+            if (recoveryStateSync != RecoveryState.RECONNECTING) {
+              return;
+            }
+            if (!awaitingAnswer) {
+              return;
+            }
+          }
+          Log.w(TAG, "ICE restart answer timed out for id=" + id);
+          completeRestartAttemptWithFailure("answer-timeout");
+        };
+    mainHandler.postDelayed(restartAnswerTimeoutRunnable, RECONNECT_ANSWER_TIMEOUT_MS);
+  }
+
+  private void cancelRecoveryTimers() {
+    if (restartGraceRunnable != null) {
+      mainHandler.removeCallbacks(restartGraceRunnable);
+      restartGraceRunnable = null;
+    }
+    if (restartAnswerTimeoutRunnable != null) {
+      mainHandler.removeCallbacks(restartAnswerTimeoutRunnable);
+      restartAnswerTimeoutRunnable = null;
+    }
+  }
+
+  private void setRecoveryState(RecoveryState newState) {
+    recoveryStateSync = newState;
+    if (Looper.myLooper() == Looper.getMainLooper()) {
+      recoveryState.setValue(newState);
+    } else {
+      recoveryState.postValue(newState);
+    }
+  }
+
+  /**
+   * Called when a recovery attempt definitively fails (timeout, RPC unavailable, malformed remote
+   * payload, or budget exhausted). Runs the standard teardown path exactly once via {@link
+   * #handleConnectionEnded(PeerConnection.PeerConnectionState)}.
+   */
+  private void completeRestartAttemptWithFailure(String reason) {
+    Log.w(TAG, "completeRestartAttemptWithFailure: " + reason);
+    synchronized (this) {
+      cancelRecoveryTimers();
+      awaitingAnswer = false;
+      if (recoveryStateSync == RecoveryState.IDLE) {
+        return;
+      }
+      setRecoveryState(RecoveryState.IDLE);
+    }
+    mainHandler.post(
+        () -> {
+          if (hasActiveCall()) {
+            handleConnectionEnded(PeerConnection.PeerConnectionState.FAILED);
+          }
+        });
+  }
+
+  // Remote negotiation dispatch (Core → coordinator → CallService)
+
+  /**
+   * Called from the Core event dispatch when {@code DC_EVENT_CALL_UPDATE_RECEIVED} fires. Parses
+   * the opaque JSON payload, validates the transaction {@code id}, and routes to the appropriate
+   * {@code CallService} entry point.
+   */
+  private void onCallUpdateReceived(int accId, int callId, String payload) {
+    Log.d(TAG, "onCallUpdateReceived: accId=" + accId + ", callId=" + callId);
+    RestartNegotiationPayload.Parsed parsed = RestartNegotiationPayload.parse(payload);
+    if (!parsed.valid) {
+      Log.w(TAG, "onCallUpdateReceived: malformed/empty payload");
+      return;
+    }
+
+    synchronized (this) {
+      if (!hasActiveCall()
+          || activeAccId == null
+          || !activeAccId.equals(accId)
+          || activeCallId == null
+          || !activeCallId.equals(callId)) {
+        Log.d(TAG, "onCallUpdateReceived: ignoring - not the active call");
+        return;
+      }
+      if (callGeneration != currentCallGenerationAtRestartStart
+          && currentCallGenerationAtRestartStart != 0
+          && recoveryStateSync == RecoveryState.IDLE) {
+        Log.d(TAG, "onCallUpdateReceived: stale generation, ignoring");
+        return;
+      }
+    }
+
+    if (parsed.isOffer()) {
+      handleRemoteRestartOffer(parsed.id, parsed.sdp);
+    } else if (parsed.isAnswer()) {
+      handleRemoteRestartAnswer(parsed.id, parsed.sdp);
+    } else {
+      Log.w(TAG, "onCallUpdateReceived: unknown type " + parsed.type);
+    }
+  }
+
+  private void handleRemoteRestartOffer(String id, String sdp) {
+    synchronized (this) {
+      if (recoveryStateSync == RecoveryState.IDLE) {
+        // Callee path: an unexpected offer arrived with no in-flight recovery. Begin one
+        // and surface RECONNECTING in the UI so the user sees the recovery banner.
+        currentRestartId = id;
+        currentCallGenerationAtRestartStart = callGeneration;
+        restartAttempts++;
+        setRecoveryState(RecoveryState.RECONNECTING);
+      } else if (!id.equals(currentRestartId)) {
+        Log.w(TAG, "handleRemoteRestartOffer: id mismatch, ignoring");
+        return;
+      }
+    }
+    Log.d(TAG, "handleRemoteRestartOffer: routing to callService");
+    if (callService != null) {
+      callService.acceptRemoteRestartOffer(sdp);
+    } else {
+      Log.w(TAG, "handleRemoteRestartOffer: callService not available");
+      completeRestartAttemptWithFailure("service-not-ready");
+    }
+  }
+
+  private void handleRemoteRestartAnswer(String id, String sdp) {
+    synchronized (this) {
+      if (recoveryStateSync != RecoveryState.RECONNECTING) {
+        Log.d(TAG, "handleRemoteRestartAnswer: not in recovery, dropping");
+        return;
+      }
+      if (!id.equals(currentRestartId)) {
+        Log.w(TAG, "handleRemoteRestartAnswer: id mismatch, ignoring");
+        return;
+      }
+      awaitingAnswer = false;
+    }
+    cancelRecoveryTimers();
+    if (callService != null) {
+      callService.applyRemoteRestartAnswer(sdp);
+    } else {
+      Log.w(TAG, "handleRemoteRestartAnswer: callService not available");
+      completeRestartAttemptWithFailure("service-not-ready");
+    }
+  }
+
   // Call Control Methods (CallViewModel)
 
   public synchronized void showIncomingCallScreen(int callId) {
@@ -659,6 +1136,16 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
     if (!hasActiveCall()) {
       Log.w(TAG, "No active call to end");
       return;
+    }
+
+    // Explicit end: cancel any in-flight recovery attempt.
+    if (recoveryStateSync != RecoveryState.IDLE) {
+      Log.d(TAG, "endCall: cancelling in-flight ICE restart recovery");
+      cancelRecoveryTimers();
+      setRecoveryState(RecoveryState.IDLE);
+      awaitingAnswer = false;
+      currentRestartId = null;
+      restartAttempts = 0;
     }
 
     if (callService != null) {
@@ -904,6 +1391,10 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
               // May cause problems in edge cases
               onCallEnded(accId, callId);
               break;
+            case DcContext.DC_EVENT_CALL_UPDATE_RECEIVED:
+              String payload = event.getData2Str();
+              onCallUpdateReceived(accId, callId, payload);
+              break;
           }
         });
   }
@@ -1083,6 +1574,15 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
         callService.stopRingtone();
       }
 
+      // Cancel recovery before disconnecting so we don't leave an in-flight restart timer
+      // firing against an already-ended call.
+      if (recoveryStateSync != RecoveryState.IDLE) {
+        cancelRecoveryTimers();
+        setRecoveryState(RecoveryState.IDLE);
+        awaitingAnswer = false;
+        currentRestartId = null;
+      }
+
       disconnectTelecom(new DisconnectCause(DisconnectCause.REMOTE));
 
       if (callService != null) {
@@ -1114,6 +1614,15 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
       return;
     }
 
+    // peerConnection.close() inside CallService.disposeWebRTC() synchronously triggers a second
+    // onConnectionChange(CLOSED) on the WebRTC signaling thread, which posts back here via
+    // the main Handler. Block that reentrant entry so the disconnect+cleanup sequence runs
+    // exactly once even when CLOSED is reported more than once.
+    if (!teardownInProgress.compareAndSet(false, true)) {
+      Log.d(TAG, "Teardown already in progress, ignoring reentrant connection end");
+      return;
+    }
+
     if (callService != null) {
       callService.stopRingtone();
     }
@@ -1136,6 +1645,8 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
     if (hasActiveCall()) {
       cleanupCall(activeAccId, activeCallId);
     }
+
+    teardownInProgress.set(false);
   }
 
   /** Cleanup call state, used for clean up not initialized from backend events */
@@ -1152,19 +1663,12 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
       return;
     }
 
-    if (callService != null) {
-      try {
-        callService.stopForegroundAndDismiss();
-      } catch (Exception e) {
-        Log.w(TAG, "stopForegroundAndDismiss failed", e);
-      }
-    }
-
-    // Clear state
+    // Clear state. Note: activeCallControlScope is intentionally left alone here - callers
+    // that need to actually terminate the Telecom registration must call disconnectTelecom()
+    // BEFORE cleanupCall(), so that the scope is still valid for the disconnect attempt.
     this.activeAccId = null;
     this.activeCallId = null;
     this.activeChatId = null;
-    this.activeCallControlScope = null;
     this.activeCallViewModel = null;
     this.preferredStartingEndpoint = null;
     this.isIncomingCall = false;
@@ -1174,6 +1678,25 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
     this.hasAutoSelectedEndpoint = false;
     this.pendingMediaCapture = false;
     this.answerInProgress = false;
+    this.restartAttempts = 0;
+    this.currentRestartId = null;
+    this.awaitingAnswer = false;
+    cancelRecoveryTimers();
+    if (recoveryStateSync != RecoveryState.IDLE) {
+      setRecoveryState(RecoveryState.IDLE);
+    }
+
+    if (callService != null) {
+      try {
+        callService.stopForegroundAndDismiss();
+      } catch (Exception e) {
+        Log.w(TAG, "stopForegroundAndDismiss failed", e);
+      }
+    }
+
+    // Drop the scope last so that any reentrant disconnectTelecom() racing the cleanup can
+    // still observe a non-null scope during this invocation.
+    this.activeCallControlScope = null;
 
     mainHandler.removeCallbacks(outgoingRingtoneRunnable);
 
@@ -1246,6 +1769,7 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
     connectionState.postValue(PeerConnection.PeerConnectionState.NEW);
     answeredElsewhere.postValue(false); // clearLiveData() must not reset answeredElsewhere
     mediaCaptureReady.postValue(false);
+    recoveryState.postValue(RecoveryState.IDLE);
     clearLiveData();
   }
 

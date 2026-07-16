@@ -70,6 +70,10 @@ public class WebRTCClient {
   private volatile boolean mutedStateChannelOpen;
   private volatile boolean enableIceTrickling;
   private final AtomicBoolean isEnded = new AtomicBoolean(false);
+  // Single-flight guard for ICE restart: only one createOffer/createAnswer restart in flight
+  // at a time. Flipped true while a restart is being gathered, back to false when the local
+  // SDP has been surfaced via the callback or on error.
+  private final AtomicBoolean isRestartInProgress = new AtomicBoolean(false);
 
   // ICE gathering
   private volatile boolean isIceGatheringComplete;
@@ -95,6 +99,18 @@ public class WebRTCClient {
     void onOfferReady(String offerSdp);
 
     void onAnswerReady(String answerSdp);
+
+    /**
+     * A fresh ICE-restart offer SDP is ready to be sent via the signaling layer. Distinct from
+     * {@link #onOfferReady} so that the initial-call path cannot accidentally consume a restart.
+     */
+    void onIceRestartOfferReady(String offerSdp);
+
+    /**
+     * A fresh ICE-restart answer SDP is ready to be sent via the signaling layer. Distinct from
+     * {@link #onAnswerReady} for the same reason as {@link #onIceRestartOfferReady}.
+     */
+    void onIceRestartAnswerReady(String answerSdp);
 
     void onRemoteVideoTrack(VideoTrack videoTrack);
 
@@ -719,6 +735,309 @@ public class WebRTCClient {
         remoteSdp);
   }
 
+  // ICE Restart
+
+  /**
+   * Caller-side: trigger an in-place ICE restart on the existing PeerConnection. Produces a new
+   * offer SDP delivered via {@link Callbacks#onIceRestartOfferReady}. The PeerConnection, media
+   * tracks, and data channels are preserved across the restart.
+   *
+   * <p>Single-flight: returns silently if another restart is already in flight.
+   */
+  public void requestIceRestart() {
+    if (isEnded.get()) {
+      Log.d(TAG, "requestIceRestart: call already ended, skipping");
+      return;
+    }
+    if (peerConnection == null) {
+      Log.w(TAG, "requestIceRestart: no peer connection");
+      return;
+    }
+    if (!isRestartInProgress.compareAndSet(false, true)) {
+      Log.d(TAG, "requestIceRestart: restart already in flight, skipping");
+      return;
+    }
+
+    // Reset ICE gathering state for this restart; the existing latches may already be counted
+    // down from the initial offer/answer.
+    synchronized (this) {
+      this.isIceGatheringComplete = false;
+      this.iceGatheringLatch = new CountDownLatch(1);
+      this.relayCandidateLatch = new CountDownLatch(1);
+      this.srflxCandidateLatch = new CountDownLatch(1);
+    }
+
+    Log.d(TAG, "requestIceRestart: triggering ICE restart");
+    peerConnection.restartIce();
+
+    peerConnection.createOffer(
+        new SdpObserver() {
+          @Override
+          public void onCreateSuccess(SessionDescription sdp) {
+            onIceRestartOfferCreated(sdp);
+          }
+
+          @Override
+          public void onSetSuccess() {}
+
+          @Override
+          public void onCreateFailure(String error) {
+            Log.e(TAG, "requestIceRestart: failed to create offer: " + error);
+            isRestartInProgress.set(false);
+            mainHandler.post(() -> callbacks.onError("Failed to create restart offer: " + error));
+          }
+
+          @Override
+          public void onSetFailure(String error) {}
+        },
+        new MediaConstraints());
+  }
+
+  private void onIceRestartOfferCreated(SessionDescription offerSdp) {
+    if (isEnded.get() || peerConnection == null) {
+      Log.d(TAG, "onIceRestartOfferCreated: call ended mid-restart, aborting");
+      isRestartInProgress.set(false);
+      return;
+    }
+
+    peerConnection.setLocalDescription(
+        new SdpObserver() {
+          @Override
+          public void onSetSuccess() {
+            Log.d(TAG, "onIceRestartOfferCreated: local description set");
+
+            new Thread(
+                    () -> {
+                      boolean gotIce = waitForEnoughIce();
+
+                      synchronized (WebRTCClient.this) {
+                        if (isEnded.get() || peerConnection == null) {
+                          Log.d(TAG, "Call ended during restart ICE gathering, aborting");
+                          isRestartInProgress.set(false);
+                          return;
+                        }
+
+                        if (!gotIce) {
+                          Log.w(TAG, "Proceeding without optimal ICE candidates on restart");
+                        }
+
+                        SessionDescription localDesc = peerConnection.getLocalDescription();
+                        if (localDesc != null) {
+                          String finalSdp = localDesc.description;
+                          mainHandler.post(() -> callbacks.onIceRestartOfferReady(finalSdp));
+                        } else {
+                          isRestartInProgress.set(false);
+                          mainHandler.post(
+                              () ->
+                                  callbacks.onError(
+                                      "Local description is null after restart ICE gathering"));
+                        }
+                      }
+                    })
+                .start();
+          }
+
+          @Override
+          public void onCreateSuccess(SessionDescription sdp) {}
+
+          @Override
+          public void onCreateFailure(String error) {}
+
+          @Override
+          public void onSetFailure(String error) {
+            Log.e(TAG, "onIceRestartOfferCreated: failed to set local description: " + error);
+            isRestartInProgress.set(false);
+            mainHandler.post(
+                () -> callbacks.onError("Failed to set restart local description: " + error));
+          }
+        },
+        offerSdp);
+  }
+
+  /**
+   * Callee-side: accept a remote ICE restart offer. Produces a new answer SDP delivered via {@link
+   * Callbacks#onIceRestartAnswerReady}.
+   */
+  public void acceptRemoteRestartOffer(String offerSdp) {
+    if (isEnded.get()) {
+      Log.d(TAG, "acceptRemoteRestartOffer: call already ended, skipping");
+      return;
+    }
+    if (peerConnection == null) {
+      Log.w(TAG, "acceptRemoteRestartOffer: no peer connection");
+      return;
+    }
+    if (!isRestartInProgress.compareAndSet(false, true)) {
+      Log.d(TAG, "acceptRemoteRestartOffer: restart already in flight, skipping");
+      return;
+    }
+
+    synchronized (this) {
+      this.isIceGatheringComplete = false;
+      this.iceGatheringLatch = new CountDownLatch(1);
+      this.relayCandidateLatch = new CountDownLatch(1);
+      this.srflxCandidateLatch = new CountDownLatch(1);
+    }
+
+    Log.d(TAG, "acceptRemoteRestartOffer: applying remote restart offer");
+    SessionDescription remoteOffer =
+        new SessionDescription(SessionDescription.Type.OFFER, offerSdp);
+
+    peerConnection.setRemoteDescription(
+        new SdpObserver() {
+          @Override
+          public void onSetSuccess() {
+            Log.d(TAG, "acceptRemoteRestartOffer: remote offer set, creating answer");
+            createIceRestartAnswer();
+          }
+
+          @Override
+          public void onCreateSuccess(SessionDescription sdp) {}
+
+          @Override
+          public void onCreateFailure(String error) {}
+
+          @Override
+          public void onSetFailure(String error) {
+            Log.e(TAG, "acceptRemoteRestartOffer: failed to set remote description: " + error);
+            isRestartInProgress.set(false);
+            mainHandler.post(
+                () -> callbacks.onError("Failed to set remote restart description: " + error));
+          }
+        },
+        remoteOffer);
+  }
+
+  private void createIceRestartAnswer() {
+    if (isEnded.get() || peerConnection == null) {
+      Log.d(TAG, "createIceRestartAnswer: call ended, aborting");
+      isRestartInProgress.set(false);
+      return;
+    }
+
+    peerConnection.createAnswer(
+        new SdpObserver() {
+          @Override
+          public void onCreateSuccess(SessionDescription sdp) {
+            onIceRestartAnswerCreated(sdp);
+          }
+
+          @Override
+          public void onSetSuccess() {}
+
+          @Override
+          public void onCreateFailure(String error) {
+            Log.e(TAG, "createIceRestartAnswer: failed to create answer: " + error);
+            isRestartInProgress.set(false);
+            mainHandler.post(() -> callbacks.onError("Failed to create restart answer: " + error));
+          }
+
+          @Override
+          public void onSetFailure(String error) {}
+        },
+        new MediaConstraints());
+  }
+
+  private void onIceRestartAnswerCreated(SessionDescription answerSdp) {
+    if (isEnded.get() || peerConnection == null) {
+      Log.d(TAG, "onIceRestartAnswerCreated: call ended mid-restart, aborting");
+      isRestartInProgress.set(false);
+      return;
+    }
+
+    peerConnection.setLocalDescription(
+        new SdpObserver() {
+          @Override
+          public void onSetSuccess() {
+            Log.d(TAG, "onIceRestartAnswerCreated: local description set");
+
+            new Thread(
+                    () -> {
+                      boolean gotIce = waitForEnoughIce();
+
+                      synchronized (WebRTCClient.this) {
+                        if (isEnded.get() || peerConnection == null) {
+                          Log.d(TAG, "Call ended during restart-answer ICE gathering, aborting");
+                          isRestartInProgress.set(false);
+                          return;
+                        }
+
+                        SessionDescription localDesc = peerConnection.getLocalDescription();
+                        if (localDesc != null) {
+                          String finalSdp = localDesc.description;
+                          mainHandler.post(() -> callbacks.onIceRestartAnswerReady(finalSdp));
+                        } else {
+                          isRestartInProgress.set(false);
+                          mainHandler.post(
+                              () ->
+                                  callbacks.onError(
+                                      "Local description is null after restart answer ICE"));
+                        }
+                      }
+                    })
+                .start();
+          }
+
+          @Override
+          public void onCreateSuccess(SessionDescription sdp) {}
+
+          @Override
+          public void onCreateFailure(String error) {}
+
+          @Override
+          public void onSetFailure(String error) {
+            Log.e(TAG, "onIceRestartAnswerCreated: failed to set local description: " + error);
+            isRestartInProgress.set(false);
+            mainHandler.post(
+                () ->
+                    callbacks.onError("Failed to set restart answer local description: " + error));
+          }
+        },
+        answerSdp);
+  }
+
+  /**
+   * Caller-side: apply the remote ICE restart answer. Releases the single-flight guard on success
+   * so subsequent failures of {@link #requestIceRestart} are not silently blocked.
+   */
+  public void applyRemoteRestartAnswer(String answerSdp) {
+    if (isEnded.get()) {
+      Log.d(TAG, "applyRemoteRestartAnswer: call already ended, skipping");
+      return;
+    }
+    if (peerConnection == null) {
+      Log.w(TAG, "applyRemoteRestartAnswer: no peer connection");
+      return;
+    }
+
+    Log.d(TAG, "applyRemoteRestartAnswer: applying remote restart answer");
+    SessionDescription remoteAnswer =
+        new SessionDescription(SessionDescription.Type.ANSWER, answerSdp);
+
+    peerConnection.setRemoteDescription(
+        new SdpObserver() {
+          @Override
+          public void onSetSuccess() {
+            Log.d(TAG, "applyRemoteRestartAnswer: remote restart answer applied");
+            isRestartInProgress.set(false);
+          }
+
+          @Override
+          public void onCreateSuccess(SessionDescription sdp) {}
+
+          @Override
+          public void onCreateFailure(String error) {}
+
+          @Override
+          public void onSetFailure(String error) {
+            Log.e(TAG, "applyRemoteRestartAnswer: failed to set remote description: " + error);
+            isRestartInProgress.set(false);
+            mainHandler.post(() -> callbacks.onError("Failed to apply restart answer: " + error));
+          }
+        },
+        remoteAnswer);
+  }
+
   // Incoming Call
 
   /** Accept incoming call */
@@ -945,6 +1264,10 @@ public class WebRTCClient {
       return;
     }
     Log.d(TAG, "Ending call");
+
+    // Make sure a pending ICE restart is released so that late SDP/set callbacks do not stay
+    // blocked on the single-flight guard.
+    isRestartInProgress.set(false);
 
     // Unblock any thread waiting in waitForEnoughIce()
     if (iceGatheringLatch != null) iceGatheringLatch.countDown();

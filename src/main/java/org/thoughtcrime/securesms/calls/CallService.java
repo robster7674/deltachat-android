@@ -9,6 +9,10 @@ import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.ToneGenerator;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 import android.os.Binder;
 import android.os.Build;
 import android.os.Handler;
@@ -18,6 +22,7 @@ import android.util.Log;
 import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 import chat.delta.rpc.RpcException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.thoughtcrime.securesms.webrtc.WebRTCClient;
 import org.webrtc.AudioTrack;
 import org.webrtc.MediaStream;
@@ -35,6 +40,15 @@ public class CallService extends Service implements WebRTCClient.Callbacks {
 
   private static final String TAG = "CallService";
 
+  // Debounce window for reacting to network changes: ignore onAvailable/onLost
+  // transitions faster than this to avoid spamming restart attempts when the system
+  // rapidly bounces between transports (e.g. Wi-Fi → cellular → Wi-Fi).
+  private static final long NETWORK_CHANGE_DEBOUNCE_MS = 1500L;
+  // Time we must continuously observe a "lost" network before triggering recovery.
+  // Combined with the debounce above, this avoids reacting to transient loss that the OS
+  // often resolves within a few seconds during normal mobile-data handoff.
+  private static final long NETWORK_LOSS_GRACE_MS = 2500L;
+
   private final IBinder binder = new LocalBinder();
 
   // WebRTC Resources
@@ -46,7 +60,32 @@ public class CallService extends Service implements WebRTCClient.Callbacks {
   private AudioFocusRequest audioFocusRequest;
   private ToneGenerator toneGenerator;
 
+  // Network state (call-scoped): only active while this service owns a live call. The
+  // application already has an app-wide NetworkCallback that drives IMAP reconnects; this
+  // call-scoped callback is separate and exists solely to fire early recovery triggers.
+  private ConnectivityManager connectivityManager;
+  private ConnectivityManager.NetworkCallback callNetworkCallback;
+  private final AtomicBoolean callNetworkCallbackRegistered = new AtomicBoolean(false);
+  // Volatile guard read inside the anonymous NetworkCallback below. Flipped false in
+  // unregisterCallScopedNetworkCallback() so any callback already in-flight can short-circuit
+  // even after we've cleared `callNetworkCallback`.
+  private volatile boolean callScopedNetworkCallbackArmed = false;
+  // Tracks the network identity at the moment the callback was registered. A subsequent
+  // onAvailable event on a different Network is treated as a handoff and may trigger
+  // proactive recovery.
+  private Network initialNetwork;
+  private final Handler networkHandler = new Handler(Looper.getMainLooper());
+  private boolean pendingNetworkLostTriggerScheduled = false;
+
   private CallCoordinator callCoordinator;
+
+  private final Runnable pendingNetworkLostTrigger =
+      () -> {
+        pendingNetworkLostTriggerScheduled = false;
+        if (callCoordinator != null) {
+          callCoordinator.onNetworkLostDetected();
+        }
+      };
 
   public class LocalBinder extends Binder {
     CallService getService() {
@@ -95,6 +134,7 @@ public class CallService extends Service implements WebRTCClient.Callbacks {
         new MediaStreamManager(getApplicationContext(), webRTCClient.getPeerConnectionFactory());
 
     fetchIceServersAndSetup();
+    registerCallScopedNetworkCallback();
   }
 
   private void fetchIceServersAndSetup() {
@@ -306,6 +346,35 @@ public class CallService extends Service implements WebRTCClient.Callbacks {
     webRTCClient.handleAnswerSdp(answerSdp);
   }
 
+  // ICE Restart entry points (call-scoped)
+
+  public void requestIceRestart() {
+    Log.d(TAG, "requestIceRestart");
+    if (webRTCClient == null) {
+      Log.w(TAG, "requestIceRestart: webRTCClient not initialized");
+      return;
+    }
+    webRTCClient.requestIceRestart();
+  }
+
+  public void acceptRemoteRestartOffer(String offerSdp) {
+    Log.d(TAG, "acceptRemoteRestartOffer");
+    if (webRTCClient == null) {
+      Log.w(TAG, "acceptRemoteRestartOffer: webRTCClient not initialized");
+      return;
+    }
+    webRTCClient.acceptRemoteRestartOffer(offerSdp);
+  }
+
+  public void applyRemoteRestartAnswer(String answerSdp) {
+    Log.d(TAG, "applyRemoteRestartAnswer");
+    if (webRTCClient == null) {
+      Log.w(TAG, "applyRemoteRestartAnswer: webRTCClient not initialized");
+      return;
+    }
+    webRTCClient.applyRemoteRestartAnswer(answerSdp);
+  }
+
   public void setAudioEnabled(boolean enabled) {
     Log.d(TAG, "setAudioEnabled: " + enabled);
 
@@ -370,6 +439,7 @@ public class CallService extends Service implements WebRTCClient.Callbacks {
   public void endCall() {
     Log.d(TAG, "endCall");
 
+    unregisterCallScopedNetworkCallback();
     disposeWebRTC();
 
     try {
@@ -395,6 +465,20 @@ public class CallService extends Service implements WebRTCClient.Callbacks {
     Log.d(TAG, "onAnswerReady callback");
 
     callCoordinator.handleAnswerReady(answerSdp);
+  }
+
+  @Override
+  public void onIceRestartOfferReady(String offerSdp) {
+    Log.d(TAG, "onIceRestartOfferReady callback");
+
+    callCoordinator.handleIceRestartOfferReady(offerSdp);
+  }
+
+  @Override
+  public void onIceRestartAnswerReady(String answerSdp) {
+    Log.d(TAG, "onIceRestartAnswerReady callback");
+
+    callCoordinator.handleIceRestartAnswerReady(answerSdp);
   }
 
   @Override
@@ -507,9 +591,126 @@ public class CallService extends Service implements WebRTCClient.Callbacks {
     Log.d(TAG, "CallService onDestroy");
 
     stopRingtone();
+    unregisterCallScopedNetworkCallback();
 
     disposeWebRTC();
 
     Log.d(TAG, "CallService destroyed");
+  }
+
+  // Network callback (call-scoped)
+
+  /**
+   * Register a default-network callback for the lifetime of the active call. We require API 29+ for
+   * {@code onLosing} (the only reliable pre-emptive signal we get from the platform without
+   * polling). On older API levels we skip proactive recovery and rely entirely on the WebRTC state
+   * machine (DISCONNECTED → RECONNECTING → restart).
+   */
+  private void registerCallScopedNetworkCallback() {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+      Log.d(TAG, "registerCallScopedNetworkCallback: API < 29, skipping proactive recovery");
+      return;
+    }
+    if (!callNetworkCallbackRegistered.compareAndSet(false, true)) {
+      return;
+    }
+    if (connectivityManager == null) {
+      connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+      if (connectivityManager == null) {
+        Log.w(TAG, "registerCallScopedNetworkCallback: ConnectivityManager unavailable");
+        callNetworkCallbackRegistered.set(false);
+        return;
+      }
+    }
+
+    NetworkRequest request =
+        new NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build();
+
+    initialNetwork = connectivityManager.getActiveNetwork();
+    callScopedNetworkCallbackArmed = true;
+
+    final ConnectivityManager.NetworkCallback cb =
+        new ConnectivityManager.NetworkCallback() {
+          @Override
+          public void onLost(Network network) {
+            if (!callScopedNetworkCallbackArmed) return;
+            Log.d(TAG, "Call network callback: onLost");
+            if (pendingNetworkLostTriggerScheduled) return;
+            pendingNetworkLostTriggerScheduled = true;
+            networkHandler.postDelayed(pendingNetworkLostTrigger, NETWORK_LOSS_GRACE_MS);
+          }
+
+          @Override
+          public void onAvailable(Network network) {
+            if (!callScopedNetworkCallbackArmed) return;
+            Log.d(TAG, "Call network callback: onAvailable: " + network);
+            // Cancel any pending "lost" trigger since we got a network back.
+            if (pendingNetworkLostTriggerScheduled) {
+              networkHandler.removeCallbacks(pendingNetworkLostTrigger);
+              pendingNetworkLostTriggerScheduled = false;
+            }
+            // Wait a short debounce window before checking whether the network identity
+            // changed - this avoids reacting to a momentary re-association on the same
+            // transport. The actual trigger lives in the coordinator.
+            networkHandler.postDelayed(
+                () -> {
+                  if (!callScopedNetworkCallbackArmed) return;
+                  Network current = connectivityManager.getActiveNetwork();
+                  if (current != null && !current.equals(initialNetwork)) {
+                    Log.d(TAG, "Call network callback: active network changed");
+                    if (callCoordinator != null) {
+                      callCoordinator.onNetworkHandoffDetected();
+                    }
+                    initialNetwork = current;
+                  }
+                },
+                NETWORK_CHANGE_DEBOUNCE_MS);
+          }
+
+          @Override
+          public void onLosing(Network network, int maxMsToLive) {
+            if (!callScopedNetworkCallbackArmed) return;
+            Log.d(TAG, "Call network callback: onLosing in " + maxMsToLive + "ms");
+            // Schedule a fallback trigger in case onLost doesn't fire or onAvailable fires
+            // on the same network.
+            if (!pendingNetworkLostTriggerScheduled) {
+              pendingNetworkLostTriggerScheduled = true;
+              networkHandler.postDelayed(
+                  pendingNetworkLostTrigger, Math.min(NETWORK_LOSS_GRACE_MS, maxMsToLive));
+            }
+          }
+        };
+
+    try {
+      connectivityManager.registerNetworkCallback(request, cb);
+      callNetworkCallback = cb;
+    } catch (Exception e) {
+      Log.e(TAG, "Failed to register call-scoped network callback", e);
+      callNetworkCallback = null;
+      callNetworkCallbackRegistered.set(false);
+    }
+  }
+
+  private void unregisterCallScopedNetworkCallback() {
+    callScopedNetworkCallbackArmed = false;
+    if (pendingNetworkLostTriggerScheduled) {
+      networkHandler.removeCallbacks(pendingNetworkLostTrigger);
+      pendingNetworkLostTriggerScheduled = false;
+    }
+    ConnectivityManager.NetworkCallback cb = callNetworkCallback;
+    callNetworkCallback = null;
+    if (cb != null && connectivityManager != null) {
+      try {
+        connectivityManager.unregisterNetworkCallback(cb);
+      } catch (Exception e) {
+        Log.w(TAG, "Failed to unregister call-scoped network callback", e);
+      }
+    }
+    if (callNetworkCallbackRegistered.compareAndSet(true, false)) {
+      // ok
+    }
+    initialNetwork = null;
   }
 }
