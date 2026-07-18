@@ -848,7 +848,16 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
     if (!sendCallUpdateViaCore(activeAccId, activeCallId, payload)) {
       Log.w(TAG, "handleIceRestartAnswerReady: Core RPC not available");
       completeRestartAttemptWithFailure("rpc-not-available");
+      return;
     }
+    // Callee-side: the offer round-trip (and local answer generation) may have already eaten
+    // most of the OFFER-kind recovery timer's 30s budget. Once we've sent the answer, the
+    // remaining work is the PeerConnection state machine driving us to CONNECTED - same
+    // window the caller gets via awaitingAnswer=true after sending its offer. Reuse the
+    // existing flag so the OFFER timer (still armed from beginRestartAttempt's callee
+    // branch) bails out instead of firing as a spurious "offer-timeout" after the answer
+    // is already in flight.
+    awaitingAnswer = true;
   }
 
   /**
@@ -992,6 +1001,15 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
               // Caller-side: an answer already landed (awaitingAnswer was cleared in
               // handleRemoteRestartAnswer), but CONNECTED has not yet arrived. The PeerConnection
               // state machine is now driving completion; let it.
+              return;
+            }
+            if (kind == RecoveryTimeoutKind.OFFER && awaitingAnswer) {
+              // Callee-side: the offer arrived and handleIceRestartAnswerReady has sent the
+              // answer back (which sets awaitingAnswer=true as the "last message sent" signal).
+              // Same "let PeerConnection drive to CONNECTED" window the caller gets. Without
+              // this guard the OFFER timer - still armed from beginRestartAttempt's callee
+              // branch - would keep counting down through offer arrival and answer send and
+              // could fire a spurious offer-timeout on a slow but successful recovery.
               return;
             }
           }
