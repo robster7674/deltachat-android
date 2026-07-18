@@ -160,7 +160,7 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
   private String currentRestartId; // UUID identifying the in-flight restart transaction
   private long currentCallGenerationAtRestartStart; // callGeneration snapshot when started
   private Runnable restartGraceRunnable;
-  private Runnable restartAnswerTimeoutRunnable;
+  private Runnable restartRecoveryTimeoutRunnable;
   private boolean awaitingAnswer = false;
   // Stashed remote answer SDP if it arrives before the local offer is fully prepared
   // (defensive: in practice offer SDP is gathered synchronously after restartIce and an
@@ -570,6 +570,7 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
    */
   private void handlePeerFailed() {
     final boolean shouldAttemptOrTeardown;
+    final boolean shouldTearDown;
     synchronized (this) {
       if (!hasActiveCall() || activeCallId == null) {
         return;
@@ -580,11 +581,16 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
         Log.d(TAG, "FAILED observed during recovery, ignoring");
         return;
       }
+      // Read restartAttempts under the same monitor that guards every other write to it
+      // (beginRestartAttempt, cleanupCall, endCall, onNetworkHandoff/Lost, etc.). Without
+      // this, eventExecutor's onCallUpdateReceived path - which runs on a separate thread from
+      // the main looper that drives handlePeerFailed - could race the read below.
+      shouldTearDown = restartAttempts >= RECONNECT_MAX_ATTEMPTS;
       shouldAttemptOrTeardown = true;
     }
     if (!shouldAttemptOrTeardown) return;
 
-    if (restartAttempts >= RECONNECT_MAX_ATTEMPTS) {
+    if (shouldTearDown) {
       Log.w(TAG, "FAILED observed with restart budget exhausted, tearing down");
       handleConnectionEnded(PeerConnection.PeerConnectionState.FAILED);
       return;
@@ -813,7 +819,7 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
       return;
     }
     awaitingAnswer = true;
-    scheduleAnswerTimeout(id);
+    scheduleRecoveryTimeout(id, RecoveryTimeoutKind.ANSWER);
   }
 
   /**
@@ -936,12 +942,14 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
 
     if (!isCaller) {
       // Callee role: surface RECONNECTING in the UI but wait for the peer's restart offer
-      // to arrive via onCallUpdateReceived. The offer's `id` becomes our currentRestartId so
-      // we never accidentally apply a stale answer from a different transaction. The
-      // restartAttempts counter is bumped above so this callee-initiated wait counts against
-      // our budget too: if the caller never sends an offer, we'll fall through to teardown
-      // via handleConnectionEnded() on the next FAILED observation or DISCONNECTED timeout.
+      // to arrive via onCallUpdateReceived. Bound the wait with the same timeout we apply on
+      // the caller side, so a missed/in-flight offer (or a caller that never observes the
+      // need to restart) does not leave the UI stuck in "Reconnecting..." indefinitely.
+      // handlePeerFailed/handlePeerDisconnected explicitly bail out while recoveryStateSync
+      // != IDLE, so DISCONNECTED/FAILED observations during this wait are not by themselves
+      // a path out - only this timer (or an explicit user hang-up / CallEnded event) is.
       Log.d(TAG, "Callee role: awaiting caller's restart offer");
+      scheduleRecoveryTimeout(currentRestartId, RecoveryTimeoutKind.OFFER);
       return;
     }
 
@@ -953,11 +961,25 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
     }
   }
 
-  private void scheduleAnswerTimeout(String id) {
-    if (restartAnswerTimeoutRunnable != null) {
-      mainHandler.removeCallbacks(restartAnswerTimeoutRunnable);
+  /** Which side of the renegotiation the recovery timer is waiting on. */
+  private enum RecoveryTimeoutKind {
+    /** Caller side: sent a restart offer, waiting for the peer's answer. */
+    ANSWER,
+    /** Callee side: waiting for the peer's restart offer to arrive. */
+    OFFER
+  }
+
+  /**
+   * Bounds how long a recovery attempt may sit in {@link RecoveryState#RECONNECTING} waiting on
+   * the next signalling round-trip. Uses {@link RecoveryTimeoutKind} to distinguish the caller-side
+   * "waiting for answer" case from the callee-side "waiting for offer" case; both share the same
+   * default budget ({@link #RECONNECT_ANSWER_TIMEOUT_MS}).
+   */
+  private void scheduleRecoveryTimeout(String id, RecoveryTimeoutKind kind) {
+    if (restartRecoveryTimeoutRunnable != null) {
+      mainHandler.removeCallbacks(restartRecoveryTimeoutRunnable);
     }
-    restartAnswerTimeoutRunnable =
+    restartRecoveryTimeoutRunnable =
         () -> {
           synchronized (CallCoordinator.this) {
             if (!id.equals(currentRestartId)) {
@@ -966,14 +988,23 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
             if (recoveryStateSync != RecoveryState.RECONNECTING) {
               return;
             }
-            if (!awaitingAnswer) {
+            if (kind == RecoveryTimeoutKind.ANSWER && !awaitingAnswer) {
+              // Caller-side: an answer already landed (awaitingAnswer was cleared in
+              // handleRemoteRestartAnswer), but CONNECTED has not yet arrived. The PeerConnection
+              // state machine is now driving completion; let it.
               return;
             }
           }
-          Log.w(TAG, "ICE restart answer timed out for id=" + id);
-          completeRestartAttemptWithFailure("answer-timeout");
+          Log.w(
+              TAG,
+              "ICE restart "
+                  + (kind == RecoveryTimeoutKind.ANSWER ? "answer" : "offer")
+                  + " timed out for id="
+                  + id);
+          completeRestartAttemptWithFailure(
+              kind == RecoveryTimeoutKind.ANSWER ? "answer-timeout" : "offer-timeout");
         };
-    mainHandler.postDelayed(restartAnswerTimeoutRunnable, RECONNECT_ANSWER_TIMEOUT_MS);
+    mainHandler.postDelayed(restartRecoveryTimeoutRunnable, RECONNECT_ANSWER_TIMEOUT_MS);
   }
 
   private void cancelRecoveryTimers() {
@@ -981,9 +1012,9 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
       mainHandler.removeCallbacks(restartGraceRunnable);
       restartGraceRunnable = null;
     }
-    if (restartAnswerTimeoutRunnable != null) {
-      mainHandler.removeCallbacks(restartAnswerTimeoutRunnable);
-      restartAnswerTimeoutRunnable = null;
+    if (restartRecoveryTimeoutRunnable != null) {
+      mainHandler.removeCallbacks(restartRecoveryTimeoutRunnable);
+      restartRecoveryTimeoutRunnable = null;
     }
   }
 
@@ -1694,8 +1725,13 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
       }
     }
 
-    // Drop the scope last so that any reentrant disconnectTelecom() racing the cleanup can
-    // still observe a non-null scope during this invocation.
+    // Drop the scope last. cleanupCall() is itself a synchronized method and disconnectTelecom()
+    // only takes the coordinator monitor for a brief snapshot/null dance before handing the scope
+    // to Telecom - so a racing disconnectTelecom() cannot interleave *into* cleanupCall() at all;
+    // it only runs before or after. The reason this statement is at the bottom is symmetric
+    // with the field clears above (state first, scope last) and keeps the sequence obvious to
+    // readers: by the time control reaches here, the scope is no longer referenced by anything
+    // inside this method.
     this.activeCallControlScope = null;
 
     mainHandler.removeCallbacks(outgoingRingtoneRunnable);
