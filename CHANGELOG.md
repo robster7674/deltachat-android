@@ -4,6 +4,7 @@
 
 * properly update message views counter for channel owner
 * Fix: Call now tries to reconnect when network changes instead of closing
+* Fix: make Telecom call-disconnect idempotent to prevent the "ongoing call" system indicator from sticking after a racing/duplicate teardown
 
 ## v2.56.0
 2026-07

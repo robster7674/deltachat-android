@@ -50,6 +50,7 @@ import com.b44t.messenger.DcEvent;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import kotlin.Unit;
 import kotlin.coroutines.Continuation;
 import kotlin.coroutines.CoroutineContext;
@@ -138,6 +139,7 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
   private boolean answerInProgress = false;
   private Observer<Boolean> answerMediaObserver;
   private int callGeneration = 0;
+  private final AtomicBoolean teardownInProgress = new AtomicBoolean(false);
 
   private CallControlScope activeCallControlScope;
   private CallViewModel activeCallViewModel;
@@ -217,9 +219,16 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
   }
 
   private void disconnectTelecom(DisconnectCause cause) {
-    CallControlScope scope = activeCallControlScope;
+    // Snapshot the scope locally and null out the field atomically under the coordinator
+    // monitor. This makes the disconnect attempt idempotent: a racing teardown cannot see a
+    // half-cleared scope, and a second concurrent invocation observes null and bails out.
+    CallControlScope scope;
+    synchronized (this) {
+      scope = activeCallControlScope;
+      activeCallControlScope = null;
+    }
     if (scope == null) {
-      Log.d(TAG, "No active CallControlScope, skipping disconnect");
+      Log.w(TAG, "No active CallControlScope, skipping disconnect (cause=" + cause.getCode() + ")");
       return;
     }
 
@@ -1135,6 +1144,15 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
       return;
     }
 
+    // peerConnection.close() inside CallService.disposeWebRTC() synchronously triggers a second
+    // onConnectionChange(CLOSED) on the WebRTC signaling thread, which posts back here via
+    // the main Handler. Block that reentrant entry so the disconnect+cleanup sequence runs
+    // exactly once even when CLOSED is reported more than once.
+    if (!teardownInProgress.compareAndSet(false, true)) {
+      Log.d(TAG, "Teardown already in progress, ignoring reentrant connection end");
+      return;
+    }
+
     if (callService != null) {
       callService.stopRingtone();
     }
@@ -1157,6 +1175,8 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
     if (hasActiveCall()) {
       cleanupCall(activeAccId, activeCallId);
     }
+
+    teardownInProgress.set(false);
   }
 
   /** Cleanup call state, used for clean up not initialized from backend events */
@@ -1183,19 +1203,12 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
 
     callGeneration++;
 
-    if (callService != null) {
-      try {
-        callService.stopForegroundAndDismiss();
-      } catch (Exception e) {
-        Log.w(TAG, "stopForegroundAndDismiss failed", e);
-      }
-    }
-
-    // Clear state
+    // Clear state. Note: activeCallControlScope is intentionally left alone here - callers
+    // that need to actually terminate the Telecom registration must call disconnectTelecom()
+    // BEFORE cleanupCall(), so that the scope is still valid for the disconnect attempt.
     this.activeAccId = null;
     this.activeCallId = null;
     this.activeChatId = null;
-    this.activeCallControlScope = null;
     this.activeCallViewModel = null;
     this.preferredStartingEndpoint = null;
     this.isIncomingCall = false;
@@ -1205,6 +1218,23 @@ public class CallCoordinator implements DcEventCenter.DcEventDelegate {
     this.hasAutoSelectedEndpoint = false;
     this.pendingMediaCapture = false;
     this.answerInProgress = false;
+
+    if (callService != null) {
+      try {
+        callService.stopForegroundAndDismiss();
+      } catch (Exception e) {
+        Log.w(TAG, "stopForegroundAndDismiss failed", e);
+      }
+    }
+
+    // Drop the scope last. cleanupCall() is itself a synchronized method and disconnectTelecom()
+    // only takes the coordinator monitor for a brief snapshot/null dance before handing the scope
+    // to Telecom - so a racing disconnectTelecom() cannot interleave *into* cleanupCall() at all;
+    // it only runs before or after. The reason this statement is at the bottom is symmetric
+    // with the field clears above (state first, scope last) and keeps the sequence obvious to
+    // readers: by the time control reaches here, the scope is no longer referenced by anything
+    // inside this method.
+    this.activeCallControlScope = null;
 
     mainHandler.removeCallbacks(outgoingRingtoneRunnable);
 
