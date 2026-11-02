@@ -199,9 +199,7 @@ public abstract class BaseConversationListFragment extends Fragment implements A
               if (isForwarding(getActivity())) {
                 message =
                     String.format(
-                        Util.getLocale(),
-                        getString(R.string.ask_forward_multiple),
-                        recipientCount);
+                        Util.getLocale(), getString(R.string.ask_forward_multiple), recipientCount);
               } else if (!uris.isEmpty()) {
                 message =
                     String.format(
