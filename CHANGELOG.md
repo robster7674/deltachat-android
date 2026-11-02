@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+* Add "Select" option when sharing or forwarding to send to multiple chats at once, including contacts without an existing chat
 * WebXDC: add per-app prompt for basic permissions (Camera, Microphone, Geolocation, Motion/Orientation Sensors)
 * Show system-message when someone unpins a message
 * Fix Hebrew translations not appearing
