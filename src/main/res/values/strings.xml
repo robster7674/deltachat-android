@@ -780,6 +780,10 @@
     <string name="video_compressing">Compressing video…</string>
     <string name="video_recode_busy">Another video is still being processed, please wait.</string>
     <string name="share_text_multiple_chats">Send this text to %1$d chats?\n\n\"%2$s\"</string>
+    <!-- menu entry shown while selecting multiple chats to share or forward to; opens a list of contacts to add as recipients, chats are created for contacts that do not have one yet -->
+    <string name="select_contacts">Select Contacts</string>
+    <!-- hint shown when tapping "Send" while sharing to multiple chats but nothing is selected yet -->
+    <string name="select_chats_hint">Tap chats to select them</string>
     <string name="share_abort">Sharing aborted due to missing permissions.</string>
 
     <!-- preferences -->
