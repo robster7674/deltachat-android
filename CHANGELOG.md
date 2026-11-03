@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+* Enter key inserts a line break in the message input on all keyboards unless "Enter Key Sends" is enabled; Shift+Enter always inserts a line break
 * WebXDC: add per-app prompt for basic permissions (Camera, Microphone, Geolocation, Motion/Orientation Sensors)
 * Show system-message when someone unpins a message
 * Fix Hebrew translations not appearing
