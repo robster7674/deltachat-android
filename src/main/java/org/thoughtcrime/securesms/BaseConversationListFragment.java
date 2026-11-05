@@ -13,11 +13,14 @@ import android.content.Intent;
 import android.graphics.Bitmap;
 import android.net.Uri;
 import android.os.AsyncTask;
+import android.os.Bundle;
 import android.util.Log;
 import android.view.Menu;
 import android.view.MenuInflater;
 import android.view.MenuItem;
 import android.widget.Toast;
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
@@ -35,6 +38,8 @@ import com.b44t.messenger.DcContext;
 import com.google.android.material.snackbar.Snackbar;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Set;
 import org.thoughtcrime.securesms.components.registration.PulsingFloatingActionButton;
 import org.thoughtcrime.securesms.connect.DcHelper;
@@ -50,6 +55,27 @@ public abstract class BaseConversationListFragment extends Fragment implements A
   protected ActionMode actionMode;
   protected PulsingFloatingActionButton fab;
 
+  // When relaying (sharing/forwarding) to multiple recipients, contacts without an existing chat
+  // can be selected as well; chats for them are only created when the user hits "Send".
+  private final Set<Integer> pendingContactIds = new LinkedHashSet<>();
+  private ActivityResultLauncher<Intent> selectContactsLauncher;
+
+  @Override
+  public void onCreate(@Nullable Bundle savedInstanceState) {
+    super.onCreate(savedInstanceState);
+    selectContactsLauncher =
+        registerForActivityResult(
+            new ActivityResultContracts.StartActivityForResult(),
+            result -> {
+              if (result.getResultCode() == Activity.RESULT_OK && result.getData() != null) {
+                handleContactsSelected(
+                    result
+                        .getData()
+                        .getIntegerArrayListExtra(ContactMultiSelectionActivity.CONTACTS_EXTRA));
+              }
+            });
+  }
+
   protected abstract boolean offerToArchive();
 
   protected abstract void setFabVisibility(boolean isActionMode);
@@ -63,7 +89,10 @@ public abstract class BaseConversationListFragment extends Fragment implements A
       BaseConversationListAdapter adapter = getListAdapter();
       adapter.toggleThreadInBatchSet(chatId);
 
-      if (adapter.getBatchSelections().isEmpty()) {
+      if (isRelayingMessageContent(getActivity())) {
+        // when sharing/forwarding, stay in selection mode, the user may want to select other chats
+        updateRelayingSelectionTitle();
+      } else if (adapter.getBatchSelections().isEmpty()) {
         actionMode.finish();
       } else {
         updateActionModeItems(actionMode.getMenu());
@@ -74,7 +103,73 @@ public abstract class BaseConversationListFragment extends Fragment implements A
     }
   }
 
+  /** Enter multi-selection mode without any chat selected, used by the "Select" menu entry. */
+  public void startMultiSelect() {
+    if (actionMode != null) return;
+    actionMode = ((AppCompatActivity) requireActivity()).startSupportActionMode(this);
+    if (actionMode != null) {
+      getListAdapter().initializeBatchMode(true);
+      getListAdapter().notifyDataSetChanged();
+      updateRelayingSelectionTitle();
+    }
+  }
+
+  private int getRelayingSelectionCount() {
+    return getListAdapter().getBatchSelections().size() + pendingContactIds.size();
+  }
+
+  private void updateRelayingSelectionTitle() {
+    if (actionMode != null) {
+      actionMode.setTitle(String.valueOf(getRelayingSelectionCount()));
+    }
+  }
+
+  private void handleSelectContacts() {
+    Intent intent = new Intent(getActivity(), ContactMultiSelectionActivity.class);
+    intent.putExtra(ContactSelectionListFragment.ALLOW_CREATION, false);
+    intent.putIntegerArrayListExtra(
+        ContactSelectionListFragment.PRESELECTED_CONTACTS, new ArrayList<>(pendingContactIds));
+    selectContactsLauncher.launch(intent);
+  }
+
+  private void handleContactsSelected(@Nullable List<Integer> contactIds) {
+    if (actionMode == null || contactIds == null) return;
+    DcContext dcContext = DcHelper.getContext(requireContext());
+    pendingContactIds.clear();
+    for (int contactId : contactIds) {
+      int chatId = dcContext.getChatIdByContactId(contactId);
+      if (chatId != 0) {
+        // there is already a chat with this contact, just select it in the list
+        getListAdapter().getBatchSelections().add((long) chatId);
+      } else {
+        pendingContactIds.add(contactId);
+      }
+    }
+    getListAdapter().notifyDataSetChanged();
+    updateRelayingSelectionTitle();
+  }
+
+  /** Creates chats for the selected contacts that do not have one yet and returns all chat ids. */
+  private Long[] collectRelayingChatIds() {
+    DcContext dcContext = DcHelper.getContext(requireContext());
+    Set<Long> chatIds = new LinkedHashSet<>(getListAdapter().getBatchSelections());
+    for (int contactId : pendingContactIds) {
+      int chatId = dcContext.createChatByContactId(contactId);
+      if (chatId != 0) {
+        chatIds.add((long) chatId);
+        getListAdapter().getBatchSelections().add((long) chatId);
+      }
+    }
+    pendingContactIds.clear();
+    return chatIds.toArray(new Long[0]);
+  }
+
   public void onItemLongClick(long chatId) {
+    if (actionMode != null && isRelayingMessageContent(getActivity())) {
+      // already selecting recipients, do not reset the selection
+      onItemClick(chatId);
+      return;
+    }
     actionMode = ((AppCompatActivity) requireActivity()).startSupportActionMode(this);
 
     if (actionMode != null) {
@@ -94,28 +189,30 @@ public abstract class BaseConversationListFragment extends Fragment implements A
       if (isActionMode) {
         fab.setOnClickListener(
             v -> {
-              final Set<Long> selectedChats = getListAdapter().getBatchSelections();
+              final int recipientCount = getRelayingSelectionCount();
+              if (recipientCount == 0) {
+                Toast.makeText(getContext(), R.string.select_chats_hint, Toast.LENGTH_SHORT).show();
+                return;
+              }
               ArrayList<Uri> uris = getSharedUris(getActivity());
               String message;
               if (isForwarding(getActivity())) {
                 message =
                     String.format(
-                        Util.getLocale(),
-                        getString(R.string.ask_forward_multiple),
-                        selectedChats.size());
+                        Util.getLocale(), getString(R.string.ask_forward_multiple), recipientCount);
               } else if (!uris.isEmpty()) {
                 message =
                     String.format(
                         Util.getLocale(),
                         getString(R.string.ask_send_files_to_selected_chats),
                         uris.size(),
-                        selectedChats.size());
+                        recipientCount);
               } else {
                 message =
                     String.format(
                         Util.getLocale(),
                         getString(R.string.share_text_multiple_chats),
-                        selectedChats.size(),
+                        recipientCount,
                         getSharedText(getActivity()));
               }
 
@@ -129,8 +226,7 @@ public abstract class BaseConversationListFragment extends Fragment implements A
                         R.string.menu_send,
                         (dialog, which) -> {
                           if (SendRelayedMessageUtil.immediatelyRelay(
-                              getActivity(),
-                              selectedChats.toArray(new Long[selectedChats.size()]))) {
+                              getActivity(), collectRelayingChatIds())) {
                             actionMode.finish();
                             actionMode = null;
                             getActivity().finish();
@@ -492,6 +588,7 @@ public abstract class BaseConversationListFragment extends Fragment implements A
       }
       setFabVisibility(true);
       initializeFabClickListener(true);
+      requireActivity().getMenuInflater().inflate(R.menu.relaying_select, menu);
     } else {
 
       MenuInflater inflater = requireActivity().getMenuInflater();
@@ -511,7 +608,10 @@ public abstract class BaseConversationListFragment extends Fragment implements A
   @Override
   public boolean onActionItemClicked(ActionMode mode, MenuItem item) {
     int itemId = item.getItemId();
-    if (itemId == R.id.menu_select_all) {
+    if (itemId == R.id.menu_select_contacts) {
+      handleSelectContacts();
+      return true;
+    } else if (itemId == R.id.menu_select_all) {
       handleSelectAllThreads();
       return true;
     } else if (itemId == R.id.menu_delete_selected) {
@@ -543,6 +643,7 @@ public abstract class BaseConversationListFragment extends Fragment implements A
   @Override
   public void onDestroyActionMode(ActionMode mode) {
     actionMode = null;
+    pendingContactIds.clear();
     getListAdapter().initializeBatchMode(false);
 
     Context context = getContext();
