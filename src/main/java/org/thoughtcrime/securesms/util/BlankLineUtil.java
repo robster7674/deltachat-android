@@ -3,10 +3,10 @@ package org.thoughtcrime.securesms.util;
 /**
  * Keeps runs of empty lines in outgoing messages intact.
  *
- * <p>The core simplifies received text and squeezes any number of consecutive empty lines down to
- * a single empty line. To keep the spacing the sender typed, every empty line inside a run of two
- * or more empty lines (between text) is replaced by an invisible zero-width space, which the core
- * does not treat as whitespace.
+ * <p>The core simplifies received text and squeezes any number of consecutive empty lines down to a
+ * single empty line. To keep the spacing the sender typed, every empty line inside a run of two or
+ * more empty lines (between text) is replaced by an invisible zero-width space, which the core does
+ * not treat as whitespace.
  */
 public final class BlankLineUtil {
 
