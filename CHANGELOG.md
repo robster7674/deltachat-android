@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+* When sharing or forwarding, tap chats to select one or more recipients; "Select Contacts" adds contacts without an existing chat
 * Keep multiple empty lines in sent messages instead of collapsing them into one
 * Enter key inserts a line break in the message input on all keyboards unless "Enter Key Sends" is enabled; Shift+Enter always inserts a line break
 * WebXDC: add per-app prompt for basic permissions (Camera, Microphone, Geolocation, Motion/Orientation Sensors)
