@@ -88,9 +88,10 @@ public abstract class BaseConversationListFragment extends Fragment implements A
     super.onSaveInstanceState(outState);
     BaseConversationListAdapter adapter = getListAdapter();
     if (adapter != null && isRelaySelecting()) {
-      long[] chatIds = new long[adapter.getBatchSelections().size()];
+      final Set<Long> selectedChats = adapter.getBatchSelections();
+      long[] chatIds = new long[selectedChats.size()];
       int i = 0;
-      for (long chatId : adapter.getBatchSelections()) chatIds[i++] = chatId;
+      for (long chatId : selectedChats) chatIds[i++] = chatId;
       outState.putLongArray(STATE_RELAY_CHAT_IDS, chatIds);
       outState.putIntegerArrayList(STATE_RELAY_CONTACT_IDS, new ArrayList<>(pendingContactIds));
     }
@@ -226,7 +227,8 @@ public abstract class BaseConversationListFragment extends Fragment implements A
     // preselect the contacts of selected 1:1 chats as well, so that they can be deselected here
     DcContext dcContext = DcHelper.getContext(requireContext());
     ArrayList<Integer> preselected = new ArrayList<>(pendingContactIds);
-    for (long chatId : getListAdapter().getBatchSelections()) {
+    final Set<Long> selectedChats = getListAdapter().getBatchSelections();
+    for (long chatId : selectedChats) {
       DcChat dcChat = dcContext.getChat((int) chatId);
       if (!dcChat.isMultiUser() && !dcChat.isSelfTalk() && !dcChat.isDeviceTalk()) {
         for (int contactId : dcContext.getChatContacts((int) chatId)) {
