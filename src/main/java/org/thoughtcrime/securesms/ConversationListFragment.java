@@ -130,6 +130,7 @@ public class ConversationListFragment extends BaseConversationListFragment
     setHasOptionsMenu(true);
     initializeFabClickListener(false);
     list.setAdapter(new ConversationListAdapter(requireActivity(), GlideApp.with(this), this));
+    syncRelaySelection();
     loadChatlistAsync();
     chatlistJustLoaded = true;
   }
@@ -172,12 +173,12 @@ public class ConversationListFragment extends BaseConversationListFragment
   }
 
   public void onNewIntent() {
-    initializeFabClickListener(actionMode != null);
+    syncRelaySelection();
   }
 
   @Override
   public BaseConversationListAdapter getListAdapter() {
-    return (BaseConversationListAdapter) list.getAdapter();
+    return list != null ? (BaseConversationListAdapter) list.getAdapter() : null;
   }
 
   @SuppressLint({"StaticFieldLeak", "NewApi"})

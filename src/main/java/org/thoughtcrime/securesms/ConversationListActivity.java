@@ -376,6 +376,10 @@ public class ConversationListActivity extends PassphraseRequiredActionBarActivit
           title.setText(R.string.chat_share_with_title);
         }
       }
+      int selectedCount = conversationListFragment.getRelaySelectionCount();
+      if (selectedCount > 0) {
+        title.setText(String.format(Util.getLocale(), "%s (%d)", title.getText(), selectedCount));
+      }
       getSupportActionBar().setDisplayHomeAsUpEnabled(true);
     } else {
       boolean multiProfile = DcHelper.getAccounts(this).getAll().length > 1;
@@ -549,8 +553,8 @@ public class ConversationListActivity extends PassphraseRequiredActionBarActivit
     } else if (itemId == R.id.menu_export_attachment) {
       handleSaveAttachment();
       return true;
-    } else if (itemId == R.id.menu_select_chats) {
-      conversationListFragment.startMultiSelect();
+    } else if (itemId == R.id.menu_select_contacts) {
+      conversationListFragment.handleSelectContacts();
       return true;
     } else if (itemId == R.id.menu_switch_account) {
       AccountManager.getInstance().showSwitchAccountMenu(this, true);
@@ -605,6 +609,12 @@ public class ConversationListActivity extends PassphraseRequiredActionBarActivit
         qrCodeHandler.handleOnlySecureJoinQr(uri.toString(), SecurejoinSource.ExternalLink, null);
       }
     }
+  }
+
+  /** Selects a chat or contact found via search as recipient when sharing or forwarding. */
+  public void selectRelayRecipientFromSearch(int chatId, int contactId) {
+    conversationListFragment.addRelayRecipient(chatId, contactId);
+    searchToolbar.collapse();
   }
 
   public void handleQrFromSearch(String rawQrString) {
@@ -727,6 +737,7 @@ public class ConversationListActivity extends PassphraseRequiredActionBarActivit
     addDeviceMessages(false);
     refreshAvatar();
     refreshUnreadIndicator();
+    conversationListFragment.clearRelaySelection();
     refreshTitle();
     conversationListFragment.resetScrollPosition();
     conversationListFragment.loadChatlistAsync();
