@@ -173,7 +173,15 @@ public class ConversationListFragment extends BaseConversationListFragment
   }
 
   public void onNewIntent() {
+    // a new share or forward starts with an empty selection
+    clearRelaySelection();
     syncRelaySelection();
+  }
+
+  @Override
+  protected boolean isRelaySelecting() {
+    // when relaying, the archive just picks a chat for the selection of the main list
+    return !archive && super.isRelaySelecting();
   }
 
   @Override

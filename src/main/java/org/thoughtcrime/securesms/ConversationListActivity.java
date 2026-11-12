@@ -116,6 +116,7 @@ public class ConversationListActivity extends PassphraseRequiredActionBarActivit
 
   private ActivityResultLauncher<Intent> relayLockLauncher;
   private ActivityResultLauncher<Intent> qrScannerLauncher;
+  private ActivityResultLauncher<Intent> relayArchiveLauncher;
 
   /**
    * used to store temporarily profile ID to delete after authorization is granted via
@@ -168,6 +169,16 @@ public class ConversationListActivity extends PassphraseRequiredActionBarActivit
                 new QrCodeHandler(this)
                     .handleQrData(
                         qrData, SecurejoinSource.Scan, SecurejoinUiPath.QrIcon, relayLockLauncher);
+              }
+            });
+
+    relayArchiveLauncher =
+        registerForActivityResult(
+            new ActivityResultContracts.StartActivityForResult(),
+            result -> {
+              if (result.getResultCode() == RESULT_OK && result.getData() != null) {
+                int chatId = result.getData().getIntExtra(ConversationActivity.CHAT_ID_EXTRA, 0);
+                if (chatId != 0) conversationListFragment.toggleRelayRecipient(chatId, 0);
               }
             });
 
@@ -613,7 +624,7 @@ public class ConversationListActivity extends PassphraseRequiredActionBarActivit
 
   /** Selects a chat or contact found via search as recipient when sharing or forwarding. */
   public void selectRelayRecipientFromSearch(int chatId, int contactId) {
-    conversationListFragment.addRelayRecipient(chatId, contactId);
+    conversationListFragment.toggleRelayRecipient(chatId, contactId);
     searchToolbar.collapse();
   }
 
@@ -669,9 +680,12 @@ public class ConversationListActivity extends PassphraseRequiredActionBarActivit
   public void onSwitchToArchive() {
     Intent intent = new Intent(this, ConversationListArchiveActivity.class);
     if (isRelayingMessageContent(this)) {
+      // the archive returns the tapped chat, which is then added to the selection here
       acquireRelayMessageContent(this, intent);
+      relayArchiveLauncher.launch(intent);
+    } else {
+      startActivity(intent);
     }
-    startActivity(intent);
     overridePendingTransition(R.anim.slide_from_right, R.anim.fade_scale_out);
   }
 

@@ -74,10 +74,11 @@ public abstract class BaseConversationListFragment extends Fragment implements A
             new ActivityResultContracts.StartActivityForResult(),
             result -> {
               if (result.getResultCode() == Activity.RESULT_OK && result.getData() != null) {
+                Intent data = result.getData();
                 handleContactsSelected(
-                    result
-                        .getData()
-                        .getIntegerArrayListExtra(ContactMultiSelectionActivity.CONTACTS_EXTRA));
+                    data.getIntegerArrayListExtra(ContactMultiSelectionActivity.CONTACTS_EXTRA),
+                    data.getIntegerArrayListExtra(
+                        ContactMultiSelectionActivity.DESELECTED_CONTACTS_EXTRA));
               }
             });
   }
@@ -86,7 +87,7 @@ public abstract class BaseConversationListFragment extends Fragment implements A
   public void onSaveInstanceState(@NonNull Bundle outState) {
     super.onSaveInstanceState(outState);
     BaseConversationListAdapter adapter = getListAdapter();
-    if (adapter != null && isRelayingMessageContent(getActivity())) {
+    if (adapter != null && isRelaySelecting()) {
       long[] chatIds = new long[adapter.getBatchSelections().size()];
       int i = 0;
       for (long chatId : adapter.getBatchSelections()) chatIds[i++] = chatId;
@@ -101,8 +102,16 @@ public abstract class BaseConversationListFragment extends Fragment implements A
 
   protected abstract BaseConversationListAdapter getListAdapter();
 
+  /**
+   * Whether this list is used to select recipients when relaying. Lists that pick a single chat for
+   * another list, as the archive, return false.
+   */
+  protected boolean isRelaySelecting() {
+    return isRelayingMessageContent(getActivity());
+  }
+
   protected void onItemClick(long chatId) {
-    if (isRelayingMessageContent(getActivity())) {
+    if (isRelaySelecting()) {
       getListAdapter().toggleThreadInBatchSet(chatId);
       getListAdapter().notifyDataSetChanged();
       onRelaySelectionChanged();
@@ -130,7 +139,7 @@ public abstract class BaseConversationListFragment extends Fragment implements A
   protected void syncRelaySelection() {
     BaseConversationListAdapter adapter = getListAdapter();
     if (adapter == null) return;
-    boolean relaying = isRelayingMessageContent(getActivity());
+    boolean relaying = isRelaySelecting();
     if (relaying && actionMode != null) {
       actionMode.finish();
     }
@@ -160,7 +169,7 @@ public abstract class BaseConversationListFragment extends Fragment implements A
 
   /** Forgets all selected recipients, eg. because the profile was switched. */
   public void clearRelaySelection() {
-    if (!isRelayingMessageContent(getActivity())) return;
+    if (getListAdapter() == null || !isRelaySelecting()) return;
     getListAdapter().getBatchSelections().clear();
     pendingContactIds.clear();
     getListAdapter().notifyDataSetChanged();
@@ -168,20 +177,25 @@ public abstract class BaseConversationListFragment extends Fragment implements A
   }
 
   /**
-   * Adds a recipient found eg. via search. If there is no chat with the contact yet, the chat is
-   * only created when the user hits "Send".
+   * Selects or deselects a recipient picked outside of this list, eg. via search or the archive. If
+   * there is no chat with the contact yet, the chat is only created when the user hits "Send".
    */
-  public void addRelayRecipient(int chatId, int contactId) {
-    if (!isRelayingMessageContent(getActivity())) return;
-    addRelayRecipientToSelection(chatId, contactId);
+  public void toggleRelayRecipient(int chatId, int contactId) {
+    if (getListAdapter() == null || !isRelaySelecting()) return;
+    if (chatId == 0) {
+      chatId = DcHelper.getContext(requireContext()).getChatIdByContactId(contactId);
+    }
+    if (chatId != 0) {
+      getListAdapter().toggleThreadInBatchSet(chatId);
+    } else if (!pendingContactIds.remove(contactId)) {
+      pendingContactIds.add(contactId);
+    }
     getListAdapter().notifyDataSetChanged();
     onRelaySelectionChanged();
   }
 
-  private void addRelayRecipientToSelection(int chatId, int contactId) {
-    if (chatId == 0) {
-      chatId = DcHelper.getContext(requireContext()).getChatIdByContactId(contactId);
-    }
+  private void addRelayContactToSelection(int contactId) {
+    int chatId = DcHelper.getContext(requireContext()).getChatIdByContactId(contactId);
     if (chatId != 0) {
       getListAdapter().getBatchSelections().add((long) chatId);
     } else {
@@ -209,18 +223,36 @@ public abstract class BaseConversationListFragment extends Fragment implements A
   }
 
   public void handleSelectContacts() {
+    // preselect the contacts of selected 1:1 chats as well, so that they can be deselected here
+    DcContext dcContext = DcHelper.getContext(requireContext());
+    ArrayList<Integer> preselected = new ArrayList<>(pendingContactIds);
+    for (long chatId : getListAdapter().getBatchSelections()) {
+      DcChat dcChat = dcContext.getChat((int) chatId);
+      if (!dcChat.isMultiUser() && !dcChat.isSelfTalk() && !dcChat.isDeviceTalk()) {
+        for (int contactId : dcContext.getChatContacts((int) chatId)) {
+          preselected.add(contactId);
+        }
+      }
+    }
     Intent intent = new Intent(getActivity(), ContactMultiSelectionActivity.class);
     intent.putExtra(ContactSelectionListFragment.ALLOW_CREATION, false);
-    intent.putIntegerArrayListExtra(
-        ContactSelectionListFragment.PRESELECTED_CONTACTS, new ArrayList<>(pendingContactIds));
+    intent.putIntegerArrayListExtra(ContactSelectionListFragment.PRESELECTED_CONTACTS, preselected);
     selectContactsLauncher.launch(intent);
   }
 
-  private void handleContactsSelected(@Nullable List<Integer> contactIds) {
-    if (!isRelayingMessageContent(getActivity()) || contactIds == null) return;
-    pendingContactIds.clear();
+  private void handleContactsSelected(
+      @Nullable List<Integer> contactIds, @Nullable List<Integer> deselectedContactIds) {
+    if (getListAdapter() == null || !isRelaySelecting() || contactIds == null) return;
+    DcContext dcContext = DcHelper.getContext(requireContext());
+    if (deselectedContactIds != null) {
+      for (int contactId : deselectedContactIds) {
+        pendingContactIds.remove(contactId);
+        int chatId = dcContext.getChatIdByContactId(contactId);
+        if (chatId != 0) getListAdapter().getBatchSelections().remove((long) chatId);
+      }
+    }
     for (int contactId : contactIds) {
-      addRelayRecipientToSelection(0, contactId);
+      addRelayContactToSelection(contactId);
     }
     getListAdapter().notifyDataSetChanged();
     onRelaySelectionChanged();
@@ -295,6 +327,7 @@ public abstract class BaseConversationListFragment extends Fragment implements A
 
   public void onItemLongClick(long chatId) {
     if (isRelayingMessageContent(getActivity())) {
+      // no batch actions as delete or pin when relaying
       onItemClick(chatId);
       return;
     }
