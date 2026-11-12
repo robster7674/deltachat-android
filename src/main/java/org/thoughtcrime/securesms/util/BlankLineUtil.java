@@ -10,7 +10,7 @@ package org.thoughtcrime.securesms.util;
  */
 public final class BlankLineUtil {
 
-  public static final char ZERO_WIDTH_SPACE = '​';
+  public static final char ZERO_WIDTH_SPACE = '\u200B';
 
   private BlankLineUtil() {}
 
